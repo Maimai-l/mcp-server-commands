@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 export let is_verbose = false;
@@ -55,8 +56,8 @@ export function always_log(message: string, data?: any) {
     // * all transports => server side log file
     const timestamp = new Date().toISOString();
     const logMessage = `[${timestamp}] ${message}${data ? ": " + JSON.stringify(data) : ""}`;
-    const defaultShareDir = process.env.HOME + "/.local/share/mcp-server-commands/";
-    const defaultLogFile = defaultShareDir + "/commands.log";
+    const defaultShareDir = path.join(os.homedir(), ".local", "share", "mcp-server-commands");
+    const defaultLogFile = path.join(defaultShareDir, "commands.log");
     const targetLogFile = cliLogFile ?? defaultLogFile;
     const targetDir = cliLogFile ? path.dirname(cliLogFile) : defaultShareDir;
     fs.mkdirSync(targetDir, { recursive: true });

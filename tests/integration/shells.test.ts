@@ -16,14 +16,12 @@ describe("test explicit shell use via executable mode (argv)", () => {
 
         expect(result.content).toEqual([
             {
-                name: "EXIT_CODE",
                 type: "text",
-                text: "0",
+                text: "EXIT_CODE: 0",
             },
             {
-                name: "STDOUT",
                 type: "text",
-                text: "Hello World\n",
+                text: "STDOUT:\nHello World\n",
             }
         ]);
     });
@@ -37,14 +35,12 @@ describe("test explicit shell use via executable mode (argv)", () => {
         expect(result.isError).toBe(true);
         expect(result.content).toEqual([
             {
-                name: "EXIT_CODE",
                 type: "text",
-                text: "127",
+                text: "EXIT_CODE: 127",
             },
             {
-                name: "STDERR",
                 type: "text",
-                text: "bash: line 1: othernonexistentcommand: command not found\n",
+                text: "STDERR:\nbash: line 1: othernonexistentcommand: command not found\n",
             },
         ]);
 
@@ -61,14 +57,12 @@ describe("test explicit shell use via executable mode (argv)", () => {
             // console.log(result);
             expect(result.content).toEqual([
                 {
-                    name: "EXIT_CODE",
                     type: "text",
-                    text: "0",
+                    text: "EXIT_CODE: 0",
                 },
                 {
-                    name: "STDOUT",
                     type: "text",
-                    text: "Hello from Fish\n",
+                    text: "STDOUT:\nHello from Fish\n",
                 },
             ]);
         }
@@ -82,12 +76,10 @@ describe("test explicit shell use via executable mode (argv)", () => {
         expect(result.isError).toBeTruthy();
         expect(result.content).toEqual([
             {
-                name: "EXIT_CODE",
                 type: "text",
-                text: "127",
+                text: "EXIT_CODE: 127",
             },
             {
-                name: "STDERR",
                 type: "text",
                 text: expect.stringContaining(
                     "fish: Unknown command: totallynonexistentcommand\nfish: \ntotallynonexistentcommand\n^~~~~~~~~~~~~~~~~~~~~~~~^"
@@ -104,14 +96,12 @@ describe("test explicit shell use via executable mode (argv)", () => {
         // console.log(result);
         expect(result.content).toEqual([
             {
-                name: "EXIT_CODE",
                 type: "text",
-                text: "0",
+                text: "EXIT_CODE: 0",
             },
             {
-                name: "STDOUT",
                 type: "text",
-                text: "Hello from Zsh\n",
+                text: "STDOUT:\nHello from Zsh\n",
             },
         ]);
     });
@@ -125,12 +115,10 @@ describe("test explicit shell use via executable mode (argv)", () => {
         expect(result.isError).toBeTruthy();
         expect(result.content).toEqual([
             {
-                name: "EXIT_CODE",
                 type: "text",
-                text: "127",
+                text: "EXIT_CODE: 127",
             },
             {
-                name: "STDERR",
                 type: "text",
                 text: expect.stringContaining("zsh: command not found: completelynonexistentcommand"),
             },
@@ -151,12 +139,10 @@ describe("test explicit shell use via executable mode (argv)", () => {
         // console.log(result);
         expect(result.content).toEqual([
             {
-                name: "EXIT_CODE",
                 type: "text",
-                text: "0",
+                text: "EXIT_CODE: 0",
             },
             {
-                name: "STDOUT",
                 type: "text",
                 text: expect.stringContaining(
                     `Line 1 from Zsh
@@ -182,14 +168,12 @@ Number 3
         // console.log(result);
         expect(result.content).toEqual([
             {
-                name: "EXIT_CODE",
                 type: "text",
-                text: "0",
+                text: "EXIT_CODE: 0",
             },
             {
-                name: "STDOUT",
                 type: "text",
-                text: "/\n",
+                text: "STDOUT:\n/\n",
             },
         ]);
     });
@@ -208,12 +192,10 @@ Number 3
         // console.log(result);
         expect(result.content).toEqual([
             {
-                name: "EXIT_CODE",
                 type: "text",
-                text: "0",
+                text: "EXIT_CODE: 0",
             },
             {
-                name: "STDOUT",
                 type: "text",
                 text: expect.stringContaining(`Line 1
 Line 2

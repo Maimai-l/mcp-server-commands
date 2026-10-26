@@ -1,266 +1,213 @@
-// TODO cleanup exec usages once spawn is ready
-import { spawn, SpawnOptions } from "child_process";
-import { ObjectEncodingOptions } from "fs";
+import { ChildProcess, spawn, SpawnOptions } from "child_process";
 import { performance } from "perf_hooks";
-import { is_verbose, verbose_log } from "./logging.js";
-import { resultFor } from "./messages.js";
-import { errorResult } from "./messages.js";
 import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { is_verbose, verbose_log } from "./logging.js";
+import { errorResult, resultFor } from "./messages.js";
+
+export const IS_WINDOWS = process.platform === "win32";
+
+function envInt(name: string, fallback: number): number {
+    const n = Number(process.env[name]);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+export const DEFAULT_TIMEOUT_MS = 30_000;
+export const MIN_TIMEOUT_MS = 1_000;
+// mcp-proxy gives up at 90 s and Cloudflare at ~100 s, so stay below both by default
+export const MAX_TIMEOUT_MS = envInt("MCP_MAX_TIMEOUT_MS", 85_000);
+// per stream (stdout, stderr)
+export const MAX_OUTPUT_BYTES = envInt("MCP_MAX_OUTPUT_BYTES", 1024 * 1024);
+// after the process exits, wait this long for its output pipes to close; a background child may keep them open forever
+export const PIPE_GRACE_MS = 500;
+// after killing the process tree, return at the latest this long later
+const KILL_GRACE_MS = 2_000;
+
+// Windows shell for command_line: PowerShell by default, MCP_SHELL=cmd switches back to cmd.exe
+export const WINDOWS_SHELL = process.env.MCP_SHELL?.toLowerCase() === "cmd" ? "cmd" : "powershell";
+// make PowerShell read and write UTF-8 (the server decodes output as UTF-8; the default code page is 936)
+const PS_PREFIX =
+    "$OutputEncoding=[Text.UTF8Encoding]::new($false); " +
+    "try{[Console]::OutputEncoding=$OutputEncoding}catch{}; " +
+    "try{[Console]::InputEncoding=$OutputEncoding}catch{}; " +
+    "$ProgressPreference='SilentlyContinue'; ";
 
 export type SpawnResult = {
-    // this is basically ExecException except I want my own type for it...
-    //   b/c I want this to represent all results
-    //   ... by the way throws put stdout/stderr on the error "result" object
-    //       hence I am replicating that here and in my promise reject calls
     stdout: string;
     stderr: string;
-
     code?: number;
-    signal?: NodeJS.Signals | undefined;
+    signal?: string;
+    message?: string;
+    notes?: string[];
 };
 
-export type SpawnFailure = SpawnResult & {
-    // ONLY on errors:
-    message?: string; // FYI redundant b/c message ~= `Command failed: ${cmd}\n${stderr}\n`
-    killed?: boolean;
-};
-
-export type SpawnPromise = Promise<CallToolResult> & { pid?: number };
-
-/**
- * Raw arguments passed to {@link runProcess}. Historically this was a loose
- * {@link Record} but we now expose a typed helper for safer access.
- */
 export type RunProcessArgs = Record<string, unknown>;
 
-/**
- * Helper class that provides typed getters for the keys accepted by
- * {@link runProcess}. It wraps a {@link RunProcessArgs} object and casts the
- * values to the expected runtime types.
- */
-export class RunProcessArgsHelper {
-    private readonly raw: RunProcessArgs;
+/** Clamp timeout_ms to MIN..MAX; missing or non-numeric values use the default. */
+export function clampTimeout(value: unknown): number {
+    const n = Number(value);
+    if (value == null || value === "" || Number.isNaN(n)) {
+        return Math.min(DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+    }
+    return Math.min(Math.max(n, MIN_TIMEOUT_MS), MAX_TIMEOUT_MS);
+}
 
-    constructor(raw: RunProcessArgs) {
-        this.raw = raw ?? {};
+/** Keeps the first MAX_OUTPUT_BYTES of a stream as raw bytes and decodes once at the end. */
+class OutputBuffer {
+    private chunks: Buffer[] = [];
+    private kept = 0;
+    dropped = 0;
+
+    add(chunk: Buffer) {
+        const take = Math.max(0, Math.min(MAX_OUTPUT_BYTES - this.kept, chunk.length));
+        if (take > 0) {
+            this.chunks.push(take === chunk.length ? chunk : chunk.subarray(0, take));
+            this.kept += take;
+        }
+        this.dropped += chunk.length - take;
     }
 
-    /** Working directory – string if supplied, otherwise undefined */
-    get cwd(): string | undefined {
-        const v = this.raw.cwd;
-        return v == null ? undefined : String(v);
-    }
-
-    /** Text to write to STDIN – string if supplied, otherwise undefined */
-    get stdin_text(): string | undefined {
-        const v = this.raw.stdin_text;
-        return v == null ? undefined : String(v);
-    }
-
-    /** Shell command line – string if supplied, otherwise undefined */
-    get commandLine(): string | undefined {
-        const v = this.raw.command_line;
-        return v == null ? undefined : String(v);
-    }
-
-    /** Executable argv – array of strings if supplied, otherwise undefined */
-    get argv(): string[] | undefined {
-        const v = this.raw.argv;
-        if (!Array.isArray(v)) return undefined;
-        return v.map((item) => String(item));
-    }
-
-    /** Timeout in milliseconds – number if supplied, otherwise undefined */
-    /** Timeout in milliseconds – always a number (default 30_000) */
-    get timeoutMs(): number {
-        const v = this.raw.timeout_ms;
-        const n = Number(v);
-        return Number.isNaN(n) ? 30_000 : n;
-    }
-
-    /** True if a shell command line is provided */
-    get isShellMode(): boolean {
-        return Boolean(this.commandLine);
-    }
-
-    /** True if an argv array with at least one element is provided */
-    get isExecutableMode(): boolean {
-        return Array.isArray(this.raw.argv) && (this.argv?.length ?? 0) > 0;
+    text(): string {
+        return Buffer.concat(this.chunks).toString("utf8");
     }
 }
 
-export function runProcess(
-    runProcessArgs: RunProcessArgs,
-): SpawnPromise {
+/** Kill the process and everything it started. */
+function killTree(child: ChildProcess) {
+    const pid = child.pid;
+    if (!pid) return;
+    if (IS_WINDOWS) {
+        const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+        killer.on("error", () => child.kill());
+        return;
+    }
+    // non-Windows children are started detached, so -pid is their process group
+    const signalGroup = (signal: NodeJS.Signals) => {
+        try { process.kill(-pid, signal); } catch { child.kill(signal); }
+    };
+    signalGroup("SIGTERM");
+    setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS).unref();
+}
+
+type SpawnPlan = { command: string; args: string[]; shell: boolean };
+
+function spawnPlan(raw: RunProcessArgs): SpawnPlan | string {
+    const commandLine = raw.command_line == null ? "" : String(raw.command_line);
+    const argv = Array.isArray(raw.argv) ? raw.argv.map(String) : [];
+    if (commandLine && argv.length) return "Cannot pass both 'command_line' and 'argv'. Use one or the other.";
+    if (!commandLine && !argv.length) return "Either 'command_line' (string) or 'argv' (array) is required.";
+
+    if (argv.length) return { command: argv[0], args: argv.slice(1), shell: false };
+    if (IS_WINDOWS && WINDOWS_SHELL === "powershell") {
+        return {
+            command: "powershell.exe",
+            args: ["-NoProfile", "-NonInteractive", "-Command", PS_PREFIX + commandLine],
+            shell: false,
+        };
+    }
+    return { command: commandLine, args: [], shell: true };
+}
+
+/** The result promise; `pid` is the started process's id (used by tests). */
+export type RunProcessPromise = Promise<CallToolResult> & { pid?: number };
+
+export function runProcess(raw: RunProcessArgs, abortSignal?: AbortSignal): RunProcessPromise {
+    raw = raw ?? {};
+    const plan = spawnPlan(raw);
+    if (typeof plan === "string") return Promise.resolve(errorResult(plan));
+
+    const timeoutMs = clampTimeout(raw.timeout_ms);
+    const stdinText = raw.stdin_text == null ? "" : String(raw.stdin_text);
+    const options: SpawnOptions = {
+        shell: plan.shell,
+        windowsHide: true,
+        // A process group lets killTree reach grandchildren. On Windows, detached means "no console", which breaks
+        // console programs (lost output, PowerShell not running at all), so taskkill /T is used there instead.
+        detached: !IS_WINDOWS,
+        stdio: [stdinText ? "pipe" : "ignore", "pipe", "pipe"],
+    };
+    if (raw.cwd != null) options.cwd = String(raw.cwd);
+
     const startTime = performance.now();
-
-    const args = new RunProcessArgsHelper(runProcessArgs);
-    if (args.isShellMode && args.isExecutableMode) {
-        return Promise.resolve(errorResult("Cannot pass both 'command_line' and 'argv'. Use one or the other."));
-    }
-    if (!args.isShellMode && !args.isExecutableMode) {
-        return Promise.resolve(errorResult("Either 'command_line' (string) or 'argv' (array) is required."));
-    }
-
-    const options: ObjectEncodingOptions & SpawnOptions = {
-        // spawn options: https://nodejs.org/api/child_process.html#child_processspawncommand-args-options
-        encoding: "utf8"
-    };
-    if (args.cwd) {
-        options.cwd = args.cwd;
-    }
-
-    let spawnCommand = "";
-    let spawnArgs: string[] = [];
-    if (args.isShellMode) {
-        (options as any).shell = true;
-        spawnCommand = String(args.commandLine);
-        spawnArgs = [];
-    } else {
-        (options as any).shell = false;
-        const argv = args.argv as string[];
-        spawnCommand = argv[0];
-        spawnArgs = argv.slice(1);
-    }
-
-    const logWithElapsedTime = (msg: string, ...rest: any[]) => {
+    const log = (msg: string, data?: unknown) => {
         if (!is_verbose) return;
-
         const elapsed = ((performance.now() - startTime) / 1000).toFixed(3);
-        verbose_log(`[${elapsed}s] ${msg}`, ...rest, spawnCommand, spawnArgs);
+        verbose_log(`[${elapsed}s] ${msg}`, data);
     };
 
-    let child_pid;
-    const promise: SpawnPromise = new Promise<CallToolResult>((resolve, reject) => {
-        if (!args.stdin_text) {
-            // PRN windowsHide on Windows, signal, killSignal
-            // FYI spawn_options.stdio => default is perfect ['pipe', 'pipe', 'pipe'] 
-            //     order: [STDIN, STDOUT, STDERR]
-            //     https://nodejs.org/api/child_process.html#optionsstdio 
-            //     'ignore' attaches /dev/null
-            //     do not set 'inherit' (causes ripgrep to see STDIN socket and search it, thus hanging)
-            options.stdio = ['ignore', 'pipe', 'pipe'];
-        }
+    let pid: number | undefined;
+    const promise: RunProcessPromise = new Promise<CallToolResult>((resolve) => {
+        const stdout = new OutputBuffer();
+        const stderr = new OutputBuffer();
+        const notes: string[] = [];
+        const timers: NodeJS.Timeout[] = [];
+        let code: number | undefined;
+        let signal: string | undefined;
+        let message: string | undefined;
+        let done = false;
+        let stopping = false;
+        let child: ChildProcess | undefined;
 
-        // remove timeout on spawn options (if set) so the built‑in spawn timeout does not interfere
-        delete (options as any).timeout;
-
-        // Use a detached child so we can kill the entire process group.
-        options.detached = true;
-
-        let settled = false;
-        const settle = (result: SpawnResult, isError: boolean) => {
-            if (settled) return;
-            settled = true;
-            if (timer) clearTimeout(timer);
-            if (isError) {
-                resolve(resultFor(result));
-            } else {
-                resolve(resultFor(result));
-            }
+        const finish = () => {
+            if (done) return;
+            done = true;
+            timers.forEach(clearTimeout);
+            abortSignal?.removeEventListener("abort", onAbort);
+            // stop reading pipes a background process may still hold
+            child?.stdout?.destroy();
+            child?.stderr?.destroy();
+            if (stdout.dropped) notes.push(`STDOUT truncated: ${stdout.dropped} bytes dropped (limit ${MAX_OUTPUT_BYTES} bytes)`);
+            if (stderr.dropped) notes.push(`STDERR truncated: ${stderr.dropped} bytes dropped (limit ${MAX_OUTPUT_BYTES} bytes)`);
+            log("RESULT", { code, signal, message, notes });
+            resolve(resultFor({ stdout: stdout.text(), stderr: stderr.text(), code, signal, message, notes }));
         };
 
-        const child = spawn(spawnCommand, spawnArgs, options);
-        logWithElapsedTime(`START SPAWN child.pid: ${child.pid}`);
-        child_pid = child.pid;
+        const stop = (why: string) => {
+            if (done || stopping || !child) return;
+            stopping = true;
+            notes.push(why);
+            log("STOP", why);
+            killTree(child);
+            timers.push(setTimeout(finish, KILL_GRACE_MS));
+        };
+        const onAbort = () => stop("cancelled by the client; process tree killed");
 
-        let stdout = "";
-        let stderr = "";
-
-        if (child.stdin && args.stdin_text) {
-            child.stdin.write(args.stdin_text);
-            child.stdin.end();
+        try {
+            child = spawn(plan.command, plan.args, options);
+        } catch (err) {
+            resolve(errorResult(`Failed to start process: ${(err as Error).message}`));
+            return;
         }
+        pid = child.pid;
+        log("SPAWN", { pid, command: plan.command, args: plan.args });
 
-        if (child.stdout) {
-            child.stdout.on("data", (chunk: Buffer | string) => {
-                stdout += chunk.toString();
-            });
+        if (child.stdin) {
+            // the child may exit without reading all input (EPIPE); without a listener that error kills the server
+            child.stdin.on("error", (err) => log("STDIN_ERROR", err.message));
+            child.stdin.end(stdinText);
         }
+        child.stdout?.on("data", (chunk: Buffer) => stdout.add(chunk));
+        child.stderr?.on("data", (chunk: Buffer) => stderr.add(chunk));
 
-        if (child.stderr) {
-            child.stderr.on("data", (chunk: Buffer | string) => {
-                stderr += chunk.toString();
-            });
-        }
-
-        child.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
-            // child process streams MAY still be open when EXIT is emitted (use close if need to ensure they're closed)
-            // "close" will come after "exit" once process is terminated + streams are closed
-            // so for now use "close" to determine if process was terminated too, that way you can access STDOUT/STDERR reliably for returning full output to agent
-            logWithElapsedTime("EXIT", { code, signal });
+        child.on("error", (err) => {
+            log("ERROR", err.message);
+            message = err.message;
+            finish();
         });
-        child.on("spawn", () => {
-            // emitted after child process starts successfully
-            // if child doesn't start, error emitted instead
-            // emitted BEFORE any data received via stdout/stderr
-            logWithElapsedTime("SPAWN")
+        child.on("exit", (exitCode, exitSignal) => {
+            log("EXIT", { exitCode, exitSignal });
+            code = exitCode ?? undefined;
+            signal = exitSignal ?? undefined;
+            timers.push(setTimeout(() => {
+                notes.push(`returned ${PIPE_GRACE_MS} ms after the process exited; its output pipes were still open (probably held by a background process it started)`);
+                finish();
+            }, PIPE_GRACE_MS));
         });
+        child.on("close", () => finish());
 
-        // Timeout handling – kill the whole process group after the supplied timeout.
-        let timer: NodeJS.Timeout | null = null;
-
-        timer = setTimeout(() => {
-            if (process.platform !== "win32") {
-                if (child.pid) { try { process.kill(-child.pid, "SIGTERM"); } catch (_) {} }
-            } else {
-                child.kill("SIGTERM");
-            }
-            const killTimeout = setTimeout(() => {
-                if (process.platform !== "win32") {
-                    if (child.pid) { try { process.kill(-child.pid, "SIGKILL"); } catch (_) {} }
-                } else {
-                    child.kill("SIGKILL");
-                }
-            }, 2000);
-            const clearKill = () => clearTimeout(killTimeout);
-            child.once("exit", clearKill);
-            child.once("close", clearKill);
-        }, args.timeoutMs);
-
-        child.on("error", (err: Error) => {
-            logWithElapsedTime("ERROR");
-            // ChildProcess 'error' docs: https://nodejs.org/api/child_process.html#event-error
-            // error running process
-            // IIUC not just b/c of command failed w/ non-zero exit code
-            const result: SpawnFailure = {
-                stdout,
-                stderr,
-                //
-                // one of these will always be non-null
-                code: (err as any).code, // set if process exited, else null
-                signal: (err as any).signal, // set if process was terminated by signal, else null
-                //
-                message: err.message,
-                // ? killed: (err as any).killed
-            };
-            logWithElapsedTime("ERROR_RESULT", result);
-            settle(result, true);
-        });
-
-        child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
-            logWithElapsedTime("CLOSE");
-            // ChildProcess 'close' docs: https://nodejs.org/api/child_process.html#event-close
-            //   'close' is after child process ends AND stdio streams are closed
-            //   - after 'exit' or 'error'
-
-            //   either code is set, or signal, but NOT BOTH
-            //   signal if process killed
-            // FYI close does not mean code==0
-            const result: SpawnResult = {
-                stdout,
-                stderr,
-                //
-                code: code ?? undefined,
-                signal: signal ?? undefined,
-                //
-            };
-            logWithElapsedTime("CLOSE_RESULT", result);
-            settle(result, false);
-        });
+        timers.push(setTimeout(() => stop(`timed out after ${timeoutMs} ms; process tree killed`), timeoutMs));
+        if (abortSignal?.aborted) onAbort();
+        else abortSignal?.addEventListener("abort", onAbort, { once: true });
     });
-    // FYI later (when needed) I can map this onto the promise that comes back from runProcess too (and tie into that unit test I have that needs pid to terminate it)
-    // Resolve the underlying spawn result, then map to CallToolResult including PID.
-    promise.pid = child_pid;
-    return promise
+    promise.pid = pid; // set synchronously above: the executor runs before `new Promise` returns
+    return promise;
 }

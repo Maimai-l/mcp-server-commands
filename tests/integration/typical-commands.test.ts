@@ -31,7 +31,6 @@ describe("validate common commands work", () => {
             expect(result.content).toEqual(
                 expect.arrayContaining([
                     {
-                        name: "STDERR",
                         type: "text",
                         text: expect.not.stringContaining("concluded that is_stdin_readable=true")
                     }
@@ -48,9 +47,8 @@ describe("validate common commands work", () => {
             // console.log(result);
             expect(result.content).toEqual(
                 expect.arrayContaining([{
-                    name: "STDOUT",
                     type: "text",
-                    text: "bar\n",
+                    text: "STDOUT:\nbar\n",
                 }])
             );
 

@@ -1,6 +1,18 @@
 import { runProcess } from "../../src/run_process.js";
 import process from "node:process"
-import { exec, spawn } from 'child_process';
+import { exec, execFileSync, spawn } from 'child_process';
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+/** A temporary git repo with one commit, for tests that run `git commit --amend`. */
+function throwawayRepo(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-commands-test-"));
+    const git = (...args: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd: dir });
+    git("init", "-q");
+    git("commit", "-q", "--allow-empty", "-m", "initial");
+    return dir;
+}
 import { once } from 'events';
 import { promisify } from "util";
 
@@ -28,14 +40,12 @@ describe("runProcess - validating argument parsing/validation and basic success/
 
             expect(result.content).toEqual([
                 {
-                    name: "EXIT_CODE",
                     type: "text",
-                    text: "0",
+                    text: "EXIT_CODE: 0",
                 },
                 {
-                    name: "STDOUT",
                     type: "text",
-                    text: "Hello World",
+                    text: "STDOUT:\nHello World",
                 },
             ]);
         });
@@ -52,14 +62,12 @@ describe("runProcess - validating argument parsing/validation and basic success/
 
             expect(result.content).toEqual([
                 {
-                    name: "EXIT_CODE",
                     type: "text",
-                    text: "0",
+                    text: "EXIT_CODE: 0",
                 },
                 {
-                    name: "STDOUT",
                     type: "text",
-                    text: "Hello World",
+                    text: "STDOUT:\nHello World",
                 },
             ]);
         });
@@ -75,12 +83,10 @@ describe("runProcess - validating argument parsing/validation and basic success/
         // make sure command succeeded so I can make assumption about default directory
         expect(pwd.content).toEqual([
             {
-                name: "EXIT_CODE",
                 type: "text",
-                text: "0",
+                text: "EXIT_CODE: 0",
             },
             {
-                name: "STDOUT",
                 type: "text",
                 // the exact output may vary, but we only need to ensure it is not "/\n"
                 text: expect.not.stringContaining("/\n"),
@@ -97,14 +103,12 @@ describe("runProcess - validating argument parsing/validation and basic success/
         // ensure setting workdir doesn't fail:
         expect(cwd.content).toEqual([
             {
-                name: "EXIT_CODE",
                 type: "text",
-                text: "0",
+                text: "EXIT_CODE: 0",
             },
             {
-                name: "STDOUT",
                 type: "text",
-                text: "/\n",
+                text: "STDOUT:\n/\n",
             },
         ]);
         expect(cwd.isError).toBeUndefined();
@@ -133,14 +137,12 @@ describe("runProcess - validating argument parsing/validation and basic success/
                 expect(result.content).toEqual([
                     // FYI use objectContaining for partial object match (i.e. in this case skip type: "text")
                     expect.objectContaining({
-                        name: expect.stringContaining("EXIT_CODE"),
-                        text: expect.stringContaining("127"),
+                        text: "EXIT_CODE: 127",
                     }),
                     expect.objectContaining({
-                        name: expect.stringContaining("STDERR"),
                         // Different shells emit different messages, but all contain
                         // the command name and a “not found” phrase.
-                        text: expect.stringMatching(/shell_nonexistentcommand.*not found/i),
+                        text: expect.stringMatching(/^STDERR:\n[\s\S]*shell_nonexistentcommand.*not found/i),
                         // i.e. gh actions:
                         //   /bin/sh: 1: shell_nonexistentcommand: not found
                     }),
@@ -167,16 +169,11 @@ describe("runProcess - validating argument parsing/validation and basic success/
                 // console.log(result);
 
                 expect(result.isError).toBe(true);
+                // the process never started, so there is no exit code, only the spawn error
                 expect(result.content).toEqual([
                     {
-                        name: "EXIT_CODE",
                         type: "text",
-                        text: expect.stringContaining("ENOENT"),
-                    },
-                    {
-                        name: "MESSAGE",
-                        type: "text",
-                        text: expect.stringContaining("spawn exec_nonexistentcommand ENOENT"),
+                        text: expect.stringContaining("MESSAGE: spawn exec_nonexistentcommand ENOENT"),
                     },
                 ]);
 
@@ -195,7 +192,6 @@ describe("runProcess - validating argument parsing/validation and basic success/
                 expect(result.isError).toBe(true);
                 expect(result.content).toEqual([
                     {
-                        name: "EXIT_CODE",
                         type: "text",
                         text: expect.stringContaining("42"),
                     },
@@ -226,7 +222,6 @@ describe("runProcess - validating argument parsing/validation and basic success/
             expect(result.isError).toBe(true);
             expect(result.content).toEqual([
                 {
-                    name: "ERROR",
                     type: "text",
                     text: expect.stringContaining(expectedMessage),
                 },
@@ -239,9 +234,12 @@ describe("runProcess - validating argument parsing/validation and basic success/
 describe('timeout', () => {
 
     const has_SIGTERM = expect.objectContaining({
-        name: "SIGNAL",
         type: "text",
         text: expect.stringMatching(/SIGTERM/i),
+    });
+    const has_timeout_note = expect.objectContaining({
+        type: "text",
+        text: expect.stringMatching(/^NOTE: timed out after \d+ ms; process tree killed$/),
     });
 
     describe('hang due to `sleep` command', () => {
@@ -253,7 +251,8 @@ describe('timeout', () => {
 
             expect(result.isError).toBe(true);
             expect(result.content).toEqual([
-                has_SIGTERM
+                has_SIGTERM,
+                has_timeout_note,
             ]);
         });
     });
@@ -267,7 +266,6 @@ describe('timeout', () => {
         expect(result.isError).toBe(true);
         expect(result.content).toEqual(expect.arrayContaining([
             expect.objectContaining({
-                name: "EXIT_CODE",
                 type: "text",
                 text: expect.stringContaining("1"),
             }),
@@ -288,12 +286,11 @@ describe('timeout', () => {
             expect(result.isError).toBe(true);
             expect(result.content).toEqual([
                 has_SIGTERM,
+                has_timeout_note,
                 expect.objectContaining({
-                    name: "STDOUT",
                     text: expect.stringContaining("Caught deadly signal TERM"),
                 }),
                 expect.objectContaining({
-                    name: "STDERR",
                     text: expect.stringContaining("Vim: Warning: Output is not to a terminal"),
                 })
             ]);
@@ -327,6 +324,8 @@ describe('timeout', () => {
                 //   editor that hangs: vim (PRN nvim might work if issues with vim)
                 //   vim appears to work on arch/mac/ubuntu so let's run with it for now!
                 command_line: "git -c core.editor=vim -c user.email='wes@wes.com' -c user.name='wes' commit --amend",
+                // run in a throwaway repo: when vim exits instead of hanging, the amend succeeds and would rewrite this repo's HEAD
+                cwd: throwawayRepo(),
                 timeout_ms: 1_000, // force abort after 1 second... give the git command and editor time to launch (at least 100ms, but lets just do 1,000ms) else you will get random failures
             });
 
@@ -343,7 +342,6 @@ describe('timeout', () => {
             // }
 
             const requiredVimWarnings = expect.objectContaining({
-                name: "STDERR",
                 // FYI \s == whitespace (including \n)
                 //     \S == not whitespace (everything else)
                 //     * means basically any lines in between (or none)
@@ -390,9 +388,8 @@ describe("runProcess - signal handling", () => {
             expect(result.isError).toBe(true);
             expect(result.content).toEqual([
                 {
-                    name: "SIGNAL",
                     type: "text",
-                    text: "SIGKILL",
+                    text: "SIGNAL: SIGKILL",
                 },
             ]);
         });
